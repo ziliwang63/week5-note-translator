@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import socket
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -17,6 +18,23 @@ TARGET_LANGUAGES = {
     'en': 'English',
     'ja': 'Japanese',
 }
+
+
+def _safe_openrouter_error_detail(error):
+    try:
+        response_body = json.loads(error.read().decode('utf-8'))
+        provider_error = response_body.get('error', {})
+        detail = provider_error.get('message') if isinstance(provider_error, dict) else None
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(detail, str):
+        return None
+    detail = ' '.join(detail.split())
+    detail = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [redacted]', detail)
+    detail = re.sub(r'\bsk-(?:or-v1-)?[A-Za-z0-9_-]{16,}\b', '[redacted key]', detail, flags=re.IGNORECASE)
+    detail = re.sub(r'(?i)(postgres(?:ql)?://)[^@\s]+@', r'\1[redacted]@', detail)
+    return detail[:240] or None
 
 
 @note_bp.route('/notes/translate', methods=['POST'])
@@ -75,12 +93,13 @@ def translate_note():
         with urlopen(api_request, timeout=TRANSLATION_TIMEOUT_SECONDS) as response:
             provider_response = json.loads(response.read().decode('utf-8'))
     except HTTPError as error:
+        provider_detail = _safe_openrouter_error_detail(error)
         if error.code == 401 or error.code == 403:
             message = 'OpenRouter rejected the API key or model access. Check your server configuration.'
         elif error.code == 429:
             message = 'OpenRouter rate limit reached. Please try again shortly.'
         elif error.code == 402:
-            message = 'OpenRouter requires available credits for this request. Check your account balance, usage limits, and model pricing.'
+            message = provider_detail or 'OpenRouter requires available credits for this request. Check your account balance, usage limits, and model pricing.'
         else:
             message = f'OpenRouter request failed with HTTP {error.code}.'
         return jsonify({'error': message}), 502
