@@ -110,3 +110,7 @@ Thumbs.db
 .coverage
 coverage.xml
 *.prof
+
+
+!.env.example
+database/

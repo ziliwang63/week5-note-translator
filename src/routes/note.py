@@ -1,7 +1,114 @@
+import json
+import os
+import socket
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
 from flask import Blueprint, jsonify, request
+from sqlalchemy.exc import SQLAlchemyError
 from src.models.note import Note, db
 
 note_bp = Blueprint('note', __name__)
+OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+TRANSLATION_TIMEOUT_SECONDS = 30
+TARGET_LANGUAGES = {
+    'zh-CN': 'Simplified Chinese',
+    'en': 'English',
+    'ja': 'Japanese',
+}
+
+
+@note_bp.route('/notes/translate', methods=['POST'])
+def translate_note():
+    """Translate a note without changing its saved contents."""
+    data = request.get_json(silent=True) or {}
+    title = data.get('title', '')
+    content = data.get('content', '')
+    target_language = data.get('target_language')
+
+    if not isinstance(title, str) or not isinstance(content, str):
+        return jsonify({'error': 'Title and content must be text.'}), 400
+    if not title.strip() and not content.strip():
+        return jsonify({'error': 'Enter a title or note content before translating.'}), 400
+    if not isinstance(target_language, str) or target_language not in TARGET_LANGUAGES:
+        return jsonify({'error': 'Choose Simplified Chinese, English, or Japanese.'}), 400
+
+    api_key = os.getenv('OPENROUTER_API_KEY')
+    model = os.getenv('OPENROUTER_MODEL')
+    if not api_key:
+        return jsonify({'error': 'Translation is not configured: OPENROUTER_API_KEY is missing.'}), 503
+    if not model:
+        return jsonify({'error': 'Translation is not configured: OPENROUTER_MODEL is missing.'}), 503
+
+    prompt_path = Path(__file__).resolve().parents[2] / 'prompts' / 'translate_prompt.md'
+    try:
+        system_prompt = prompt_path.read_text(encoding='utf-8')
+    except OSError:
+        return jsonify({'error': 'Translation prompt file is unavailable on the server.'}), 500
+
+    payload = {
+        'model': model,
+        'messages': [
+            {
+                'role': 'system',
+                'content': f'{system_prompt}\n\nTarget language: {TARGET_LANGUAGES[target_language]}.',
+            },
+            {
+                'role': 'user',
+                'content': json.dumps({'title': title, 'content': content}, ensure_ascii=False),
+            },
+        ],
+        'temperature': 0.2,
+    }
+    api_request = Request(
+        OPENROUTER_URL,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        with urlopen(api_request, timeout=TRANSLATION_TIMEOUT_SECONDS) as response:
+            provider_response = json.loads(response.read().decode('utf-8'))
+    except HTTPError as error:
+        if error.code == 401 or error.code == 403:
+            message = 'OpenRouter rejected the API key or model access. Check your server configuration.'
+        elif error.code == 429:
+            message = 'OpenRouter rate limit reached. Please try again shortly.'
+        elif error.code == 402:
+            message = 'OpenRouter requires available credits for this request. Check your account balance, usage limits, and model pricing.'
+        else:
+            message = f'OpenRouter request failed with HTTP {error.code}.'
+        return jsonify({'error': message}), 502
+    except (TimeoutError, socket.timeout):
+        return jsonify({'error': 'Translation timed out. Please try again.'}), 504
+    except URLError as error:
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            return jsonify({'error': 'Translation timed out. Please try again.'}), 504
+        return jsonify({'error': 'Could not connect to OpenRouter. Check the server network and try again.'}), 502
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({'error': 'OpenRouter returned an unreadable response.'}), 502
+
+    try:
+        translated_text = provider_response['choices'][0]['message']['content']
+        translated = json.loads(translated_text)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return jsonify({'error': 'Translation result was not valid JSON with title and content fields.'}), 502
+
+    if not isinstance(translated, dict):
+        return jsonify({'error': 'Translation result must be a JSON object with title and content fields.'}), 502
+    translated_title = translated.get('title')
+    translated_content = translated.get('content')
+    if not isinstance(translated_title, str) or not isinstance(translated_content, str):
+        return jsonify({'error': 'Translation result must contain text fields named title and content.'}), 502
+    if (title.strip() and not translated_title.strip()) or (content.strip() and not translated_content.strip()):
+        return jsonify({'error': 'Translation result was missing translated title or content.'}), 502
+
+    return jsonify({'title': translated_title.strip(), 'content': translated_content.strip()})
 
 @note_bp.route('/notes', methods=['GET'])
 def get_notes():
@@ -23,7 +130,9 @@ def create_note():
         return jsonify(note.to_dict()), 201
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        if isinstance(e, SQLAlchemyError):
+            return jsonify({'error': 'Database operation failed. Check database configuration and connectivity.'}), 503
+        return jsonify({'error': 'Could not create the note.'}), 500
 
 @note_bp.route('/notes/<int:note_id>', methods=['GET'])
 def get_note(note_id):
@@ -47,7 +156,9 @@ def update_note(note_id):
         return jsonify(note.to_dict())
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        if isinstance(e, SQLAlchemyError):
+            return jsonify({'error': 'Database operation failed. Check database configuration and connectivity.'}), 503
+        return jsonify({'error': 'Could not update the note.'}), 500
 
 @note_bp.route('/notes/<int:note_id>', methods=['DELETE'])
 def delete_note(note_id):
@@ -59,7 +170,9 @@ def delete_note(note_id):
         return '', 204
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        if isinstance(e, SQLAlchemyError):
+            return jsonify({'error': 'Database operation failed. Check database configuration and connectivity.'}), 503
+        return jsonify({'error': 'Could not delete the note.'}), 500
 
 @note_bp.route('/notes/search', methods=['GET'])
 def search_notes():
