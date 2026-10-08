@@ -13,6 +13,7 @@ from src.models.note import Note, db
 note_bp = Blueprint('note', __name__)
 OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
 TRANSLATION_TIMEOUT_SECONDS = 30
+MAX_TRANSLATION_TOKENS = 3500
 TARGET_LANGUAGES = {
     'zh-CN': 'Simplified Chinese',
     'en': 'English',
@@ -78,6 +79,7 @@ def translate_note():
             },
         ],
         'temperature': 0.2,
+        'max_tokens': MAX_TRANSLATION_TOKENS,
     }
     api_request = Request(
         OPENROUTER_URL,
